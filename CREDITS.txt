@@ -5,3 +5,4 @@ this project:
 
  - Nat Tuck [nathaniel.tuck@plymouth.edu]
 
+ - Tyler Smallidge [tjs1143@usnh.edu]
