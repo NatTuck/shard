@@ -1,12 +1,16 @@
 defmodule ShardWeb.MudGameLive do
   use ShardWeb, :live_view
   alias Shard.Map, as: GameMap
+  alias Shard.Npcs.Npc
+  alias Shard.Quests.Quest
+  alias Shard.Quests
   alias Shard.Repo
+  import Ecto.Query
 
   @impl true
-  def mount(_params, _session, socket) do
-    # Generate map data first
-    map_data = generate_map_from_database()
+  def mount(%{"map_id" => map_id}, _session, socket) do
+    # Generate map data based on selected map
+    map_data = generate_map_from_database(map_id)
 
     # Find a valid starting position (first floor tile found)
     starting_position = find_valid_starting_position(map_data)
@@ -15,6 +19,7 @@ defmodule ShardWeb.MudGameLive do
     game_state = %{
       player_position: starting_position,
       map_data: map_data,
+      map_id: map_id,
       active_panel: nil,
       player_stats: %{
         health: 100,
@@ -45,11 +50,58 @@ defmodule ShardWeb.MudGameLive do
         slot_5: nil
       },
       quests: [
-        %{title: "The Lost Artifact", status: "In Progress", progress: "2/5 artifacts found"},
-        %{title: "Clear the Dungeon", status: "Available", progress: "0/10 enemies slain"},
-        %{title: "Merchant's Request", status: "Completed", progress: "Done"}
+
+      ],
+      pending_quest_offer: nil,  # Stores quest offer waiting for acceptance/denial
+
+      # Will pull from db once that is created.
+      monsters: [
+        %{
+          monster_id: 1,
+          name: "Goblin",
+          level: 1,
+          attack: 10,
+          defense: 0,
+          speed: 5,
+          xp_reward: 5,
+          gold_reward: 2,
+          boss: false,
+          hp: 30,
+          hp_max: 30,
+          position: {2, 2}
+          #position: find_valid_monster_position(map_data, starting_position)
+        },
+        # %{
+        #   monster_id: 1,
+        #   name: "Goblin",
+        #   level: 1,
+        #   attack: 10,
+        #   defense: 0,
+        #   speed: 5,
+        #   xp_reward: 5,
+        #   gold_reward: 2,
+        #   boss: false,
+        #   hp: 30,
+        #   hp_max: 30,
+        #   position: find_valid_monster_position(map_data, starting_position)
+        # },%{
+        #   monster_id: 1,
+        #   name: "Goblin",
+        #   level: 1,
+        #   attack: 10,
+        #   defense: 0,
+        #   speed: 5,
+        #   xp_reward: 5,
+        #   gold_reward: 2,
+        #   boss: false,
+        #   hp: 30,
+        #   hp_max: 30,
+        #   position: find_valid_monster_position(map_data, starting_position)
+        # }
       ]
     }
+
+    IO.inspect(game_state.monsters, label: "Generated monsters with positions")
 
     terminal_state = %{
       output: [
@@ -69,14 +121,16 @@ defmodule ShardWeb.MudGameLive do
     }
 
     {:ok,
-     assign(socket,
-       game_state: game_state,
-       terminal_state: terminal_state,
-       modal_state: modal_state
-     )}
+ assign(socket,
+   game_state: game_state,
+   terminal_state: terminal_state,
+   modal_state: modal_state,
+   available_exits: compute_available_exits(game_state.player_position)
+ )}
   end
 
   @impl true
+  @spec render(any()) :: Phoenix.LiveView.Rendered.t()
   def render(assigns) do
     ~H"""
     <div class="flex flex-col h-screen bg-gray-900 text-white" phx-window-keydown="keypress">
@@ -170,6 +224,152 @@ defmodule ShardWeb.MudGameLive do
       </footer>
     </div>
     """
+  end
+
+  # Execute quest acceptance
+  defp execute_accept_quest(game_state) do
+    case game_state.pending_quest_offer do
+      nil ->
+        {["There is no quest offer to accept."], game_state}
+
+      %{quest: quest, npc: npc} ->
+        npc_name = npc.name || "Unknown NPC"
+        quest_title = quest.title || "Untitled Quest"
+
+        # Check if quest has already been accepted or completed
+        user_id = 1  # Mock user_id - should come from session in real implementation
+
+        already_accepted = try do
+          Shard.Quests.quest_ever_accepted_by_user?(user_id, quest.id)
+        rescue
+          error ->
+            IO.inspect(error, label: "Error checking if quest already accepted")
+            false
+        end
+
+        if already_accepted do
+          response = [
+            "#{npc_name} looks at you with confusion.",
+            "",
+            "\"You have already accepted this quest. I cannot offer it to you again.\""
+          ]
+
+          updated_game_state = %{game_state | pending_quest_offer: nil}
+          {response, updated_game_state}
+        else
+          # Accept the quest in the database
+          accept_result = try do
+            Shard.Quests.accept_quest(user_id, quest.id)
+          rescue
+            error ->
+            IO.inspect(error, label: "Error accepting quest")
+            {:error, :database_error}
+          end
+
+          case accept_result do
+            {:ok, _quest_acceptance} ->
+              # Add quest to player's active quests in game state
+              new_quest = %{
+                id: quest.id,
+                title: quest_title,
+                status: "In Progress",
+                progress: "0% complete",
+                npc_giver: npc_name,
+                description: quest.description
+              }
+
+              updated_quests = [new_quest | game_state.quests]
+
+              response = [
+                "You accept the quest '#{quest_title}' from #{npc_name}.",
+                "",
+                "#{npc_name} says: \"Excellent! I knew I could count on you.\"",
+                "",
+                "Quest '#{quest_title}' has been added to your quest log."
+              ]
+
+              updated_game_state = %{game_state |
+                quests: updated_quests,
+                pending_quest_offer: nil
+              }
+
+              {response, updated_game_state}
+
+            {:error, :quest_already_completed} ->
+              response = [
+                "#{npc_name} looks at you with confusion.",
+                "",
+                "\"You have already completed this quest. I cannot offer it to you again.\""
+              ]
+
+              updated_game_state = %{game_state | pending_quest_offer: nil}
+              {response, updated_game_state}
+
+            {:error, :database_error} ->
+              # Fallback: add quest to game state even if database fails
+              new_quest = %{
+                id: quest.id,
+                title: quest_title,
+                status: "In Progress",
+                progress: "0% complete",
+                npc_giver: npc_name,
+                description: quest.description
+              }
+
+              updated_quests = [new_quest | game_state.quests]
+
+              response = [
+                "You accept the quest '#{quest_title}' from #{npc_name}.",
+                "",
+                "#{npc_name} says: \"Excellent! I knew I could count on you.\"",
+                "",
+                "Quest '#{quest_title}' has been added to your quest log.",
+                "(Note: Quest saved locally due to database issue)"
+              ]
+
+              updated_game_state = %{game_state |
+                quests: updated_quests,
+                pending_quest_offer: nil
+              }
+
+              {response, updated_game_state}
+
+            {:error, _changeset} ->
+              response = [
+                "#{npc_name} looks troubled.",
+                "",
+                "\"I'm sorry, but there seems to be an issue with accepting this quest right now.\""
+              ]
+
+              updated_game_state = %{game_state | pending_quest_offer: nil}
+              {response, updated_game_state}
+          end
+        end
+    end
+  end
+
+  # Execute quest denial
+  defp execute_deny_quest(game_state) do
+    case game_state.pending_quest_offer do
+      nil ->
+        {["There is no quest offer to deny."], game_state}
+
+      %{quest: quest, npc: npc} ->
+        npc_name = npc.name || "Unknown NPC"
+        quest_title = quest.title || "Untitled Quest"
+
+        response = [
+          "You decline the quest '#{quest_title}' from #{npc_name}.",
+          "",
+          "#{npc_name} says: \"I understand. Perhaps another time when you're ready.\"",
+          "",
+          "The quest offer has been declined."
+        ]
+
+        updated_game_state = %{game_state | pending_quest_offer: nil}
+
+        {response, updated_game_state}
+    end
   end
 
   defp character_sheet(assigns) do
@@ -426,6 +626,33 @@ defmodule ShardWeb.MudGameLive do
 
             <div class="mt-6">
               <h4 class="text-lg font-semibold mb-2">Map Legend</h4>
+
+      <div class="bg-gray-800 rounded-lg p-4 mt-4">
+        <h4 class="text-lg font-semibold mb-3 text-center">Exits</h4>
+
+        <%= if @available_exits in [nil, []] do %>
+          <div class="text-center text-gray-400">No visible exits</div>
+        <% else %>
+          <div class="grid grid-cols-2 gap-2">
+            <%= for exit <- @available_exits do %>
+              <button
+                phx-click="click_exit"
+                phx-value-dir={exit.direction}
+                class="bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded text-center border border-gray-600"
+                title={"Move " <> exit.direction}
+              >
+                <%= String.capitalize(exit.direction) %>
+              </button>
+            <% end %>
+          </div>
+        <% end %>
+
+        <div class="text-xs text-gray-400 mt-2 text-center">
+          Tip: Arrow keys still work for movement.
+        </div>
+      </div>
+
+
               <div class="grid grid-cols-2 md:grid-cols-3 gap-2">
                 <!-- Room Types -->
                 <div class="flex items-center">
@@ -456,8 +683,8 @@ defmodule ShardWeb.MudGameLive do
                   <div class="w-4 h-4 bg-red-500 ring-2 ring-red-300 rounded-full mr-2"></div>
                   <span class="text-sm">Player</span>
                 </div>
-                
-    <!-- Door Types -->
+
+                <!-- Door Types -->
                 <div class="col-span-2 md:col-span-3 mt-2">
                   <h5 class="text-sm font-semibold mb-1">Door Types:</h5>
                   <div class="grid grid-cols-2 md:grid-cols-3 gap-1 text-xs">
@@ -656,46 +883,28 @@ defmodule ShardWeb.MudGameLive do
   # Handle keypresses for navigation, inventory, etc.
   def handle_event("keypress", %{"key" => key}, socket) do
     IO.inspect(key, pretty: true)
-    player_position = socket.assigns.game_state.player_position
-    map_data = socket.assigns.game_state.map_data
-    new_position = calc_position(player_position, key, map_data)
 
-    # Add movement message to terminal if position changed
-    terminal_state =
-      if new_position != player_position do
-        direction_name =
-          case key do
-            "ArrowUp" -> "north"
-            "ArrowDown" -> "south"
-            "ArrowRight" -> "east"
-            "ArrowLeft" -> "west"
-            _ -> nil
-          end
+    # Check if it's a movement key
+    case key do
+      arrow_key when arrow_key in ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"] ->
+        # Use the same execute_movement function that terminal commands use
+        {response, updated_game_state} = execute_movement(socket.assigns.game_state, arrow_key)
 
-        if direction_name do
-          new_output =
-            socket.assigns.terminal_state.output ++
-              ["You traversed #{direction_name}.", ""]
+        # Add the response to terminal output
+        new_output = socket.assigns.terminal_state.output ++ response ++ [""]
+        terminal_state = Map.put(socket.assigns.terminal_state, :output, new_output)
 
-          Map.put(socket.assigns.terminal_state, :output, new_output)
-        else
-          socket.assigns.terminal_state
-        end
-      else
-        socket.assigns.terminal_state
-      end
+        {:noreply,
+         assign(socket,
+           game_state: updated_game_state,
+           terminal_state: terminal_state,
+           available_exits: compute_available_exits(updated_game_state.player_position)
+         )}
 
-    game_state = %{
-      player_position: new_position,
-      map_data: map_data,
-      active_panel: nil,
-      player_stats: socket.assigns.game_state.player_stats,
-      hotbar: socket.assigns.game_state.hotbar,
-      inventory_items: socket.assigns.game_state.inventory_items,
-      quests: socket.assigns.game_state.quests
-    }
-
-    {:noreply, assign(socket, game_state: game_state, terminal_state: terminal_state)}
+      _ ->
+        # Non-movement key, do nothing
+        {:noreply, socket}
+    end
   end
 
   def handle_event("submit_command", %{"command" => %{"text" => command_text}}, socket) do
@@ -734,35 +943,28 @@ defmodule ShardWeb.MudGameLive do
 
   # To calculate new player position on map
   def calc_position(curr_position, key, _map_data) do
-    new_position =
-      case key do
-        "ArrowUp" ->
-          {elem(curr_position, 0), elem(curr_position, 1) - 1}
+  new_position = case key do
+    # Align with DB: north increases y, south decreases y
+    "ArrowUp" ->
+      {elem(curr_position, 0), elem(curr_position, 1) + 1}
+    "ArrowDown" ->
+      {elem(curr_position, 0), elem(curr_position, 1) - 1}
+    "ArrowRight" ->
+      {elem(curr_position, 0) + 1, elem(curr_position, 1)}
+    "ArrowLeft" ->
+      {elem(curr_position, 0) - 1, elem(curr_position, 1)}
+    "northeast" ->
+      {elem(curr_position, 0) + 1, elem(curr_position, 1) + 1}
+    "southeast" ->
+      {elem(curr_position, 0) + 1, elem(curr_position, 1) - 1}
+    "northwest" ->
+      {elem(curr_position, 0) - 1, elem(curr_position, 1) + 1}
+    "southwest" ->
+      {elem(curr_position, 0) - 1, elem(curr_position, 1) - 1}
 
-        "ArrowDown" ->
-          {elem(curr_position, 0), elem(curr_position, 1) + 1}
-
-        "ArrowRight" ->
-          {elem(curr_position, 0) + 1, elem(curr_position, 1)}
-
-        "ArrowLeft" ->
-          {elem(curr_position, 0) - 1, elem(curr_position, 1)}
-
-        "northeast" ->
-          {elem(curr_position, 0) + 1, elem(curr_position, 1) - 1}
-
-        "southeast" ->
-          {elem(curr_position, 0) + 1, elem(curr_position, 1) + 1}
-
-        "northwest" ->
-          {elem(curr_position, 0) - 1, elem(curr_position, 1) - 1}
-
-        "southwest" ->
-          {elem(curr_position, 0) - 1, elem(curr_position, 1) + 1}
-
-        _other ->
-          curr_position
-      end
+      _other  ->
+        curr_position
+    end
 
     # Check if the movement is valid (room exists or door connection exists)
     if is_valid_movement?(curr_position, new_position, key) do
@@ -798,19 +1000,20 @@ defmodule ShardWeb.MudGameLive do
 
       room ->
         # Check if there's a door in the specified direction from current room
-        direction_str =
-          case direction do
-            "ArrowUp" -> "north"
-            "ArrowDown" -> "south"
-            "ArrowRight" -> "east"
-            "ArrowLeft" -> "west"
-            "northeast" -> "northeast"
-            "southeast" -> "southeast"
-            "northwest" -> "northwest"
-            "southwest" -> "southwest"
-            _ -> nil
-          end
-
+==== BASE ====
+        direction_str = case direction do
+          "ArrowUp" -> "north"
+          "ArrowDown" -> "south"
+          "ArrowRight" -> "east"
+          "ArrowLeft" -> "west"
+          "northeast" -> "northeast"
+          "southeast" -> "southeast"
+          "northwest" -> "northwest"
+          "southwest" -> "southwest"
+          _ -> nil
+        end
+        
+==== BASE ====
         if direction_str do
           door = GameMap.get_door_in_direction(room.id, direction_str)
 
@@ -818,8 +1021,9 @@ defmodule ShardWeb.MudGameLive do
             nil ->
               # No door, check if target position has a room
               is_valid_position?(new_pos, nil)
-
-            door ->
+==== BASE ====
+            door -> 
+==== BASE ====
               # Check door accessibility based on type and status
               cond do
                 door.is_locked ->
@@ -922,32 +1126,35 @@ defmodule ShardWeb.MudGameLive do
     doors = Repo.all(GameMap.Door) |> Repo.preload([:from_room, :to_room])
 
     # Filter out rooms without coordinates
-    valid_rooms =
-      Enum.filter(rooms, fn room ->
-        room.x_coordinate != nil and room.y_coordinate != nil
-      end)
-
+==== BASE ====
+    valid_rooms = Enum.filter(rooms, fn room -> 
+      room.x_coordinate != nil and room.y_coordinate != nil 
+    end)
+    
+==== BASE ====
     # Filter out doors without valid room connections
-    valid_doors =
-      Enum.filter(doors, fn door ->
-        door.from_room && door.to_room &&
-          door.from_room.x_coordinate != nil && door.from_room.y_coordinate != nil &&
-          door.to_room.x_coordinate != nil && door.to_room.y_coordinate != nil
-      end)
-
+==== BASE ====
+    valid_doors = Enum.filter(doors, fn door ->
+      door.from_room && door.to_room &&
+      door.from_room.x_coordinate != nil && door.from_room.y_coordinate != nil &&
+      door.to_room.x_coordinate != nil && door.to_room.y_coordinate != nil
+    end)
+    
+==== BASE ====
     # Calculate bounds and scaling for the minimap
     {bounds, scale_factor} = calculate_minimap_bounds(valid_rooms)
-
-    assigns =
-      assign(assigns,
-        rooms: valid_rooms,
-        doors: valid_doors,
-        bounds: bounds,
-        scale_factor: scale_factor,
-        all_rooms_count: length(rooms),
-        all_doors_count: length(doors)
-      )
-
+==== BASE ====
+    
+    assigns = assign(assigns, 
+      rooms: valid_rooms, 
+      doors: valid_doors, 
+      bounds: bounds, 
+      scale_factor: scale_factor,
+      all_rooms_count: length(rooms),
+      all_doors_count: length(doors)
+    )
+    
+==== BASE ====
     ~H"""
     <div class="bg-gray-700 rounded-lg p-4 shadow-xl">
       <h2 class="text-xl font-semibold mb-4 text-center">Minimap</h2>
@@ -957,8 +1164,10 @@ defmodule ShardWeb.MudGameLive do
           <%= for door <- @doors do %>
             <.door_line door={door} bounds={@bounds} scale_factor={@scale_factor} />
           <% end %>
+==== BASE ====
           
-    <!-- Render rooms as circles -->
+          <!-- Render rooms as circles -->
+==== BASE ====
           <%= for room <- @rooms do %>
             <.room_circle
               room={room}
@@ -967,8 +1176,10 @@ defmodule ShardWeb.MudGameLive do
               scale_factor={@scale_factor}
             />
           <% end %>
+==== BASE ====
           
-    <!-- Show player position even if no room exists there -->
+          <!-- Show player position even if no room exists there -->
+==== BASE ====
           <%= if @player_position not in Enum.map(@rooms, &{&1.x_coordinate, &1.y_coordinate}) do %>
             <.player_marker
               position={@player_position}
@@ -981,7 +1192,10 @@ defmodule ShardWeb.MudGameLive do
       <div class="mt-4 text-center text-sm text-gray-300">
         <p>Player Position: {format_position(@player_position)}</p>
         <p class="text-xs mt-1">
-          Showing: {length(@rooms)}/{@all_rooms_count} rooms | {length(@doors)}/{@all_doors_count} doors
+==== BASE ====
+          Showing: <%= length(@rooms) %>/<%= @all_rooms_count %> rooms | 
+          <%= length(@doors) %>/<%= @all_doors_count %> doors
+==== BASE ====
         </p>
         <%= if length(@rooms) == 0 do %>
           <p class="text-xs text-yellow-400 mt-1">No rooms with coordinates found in database</p>
@@ -994,48 +1208,43 @@ defmodule ShardWeb.MudGameLive do
   # Component for individual room circles in the minimap
   def room_circle(assigns) do
     return_early = assigns.room.x_coordinate == nil or assigns.room.y_coordinate == nil
-
-    assigns =
-      if return_early do
-        assign(assigns, :skip_render, true)
-      else
-        # Calculate position within the minimap bounds
-        {x_pos, y_pos} =
-          calculate_minimap_position(
-            {assigns.room.x_coordinate, assigns.room.y_coordinate},
-            assigns.bounds,
-            assigns.scale_factor
-          )
-
-        # Define colors for rooms based on room type
-        {fill_color, stroke_color} =
-          case assigns.room.room_type do
-            # Green for safe zones
-            "safe_zone" -> {"#10b981", "#34d399"}
-            # Orange for shops
-            "shop" -> {"#f59e0b", "#fbbf24"}
-            # Dark red for dungeons
-            "dungeon" -> {"#7c2d12", "#dc2626"}
-            # Gold for treasure rooms
-            "treasure_room" -> {"#eab308", "#facc15"}
-            # Red for trap rooms
-            "trap_room" -> {"#991b1b", "#ef4444"}
-            # Blue for standard rooms
-            _ -> {"#3b82f6", "#60a5fa"}
-          end
-
-        player_stroke = if assigns.is_player, do: "#ef4444", else: stroke_color
-        player_width = if assigns.is_player, do: "3", else: "1"
-
-        assign(assigns,
-          x_pos: x_pos,
-          y_pos: y_pos,
-          fill_color: fill_color,
-          stroke_color: player_stroke,
-          stroke_width: player_width,
-          skip_render: false
-        )
+==== BASE ====
+    
+    assigns = if return_early do
+      assign(assigns, :skip_render, true)
+    else
+      # Calculate position within the minimap bounds
+      {x_pos, y_pos} = calculate_minimap_position(
+        {assigns.room.x_coordinate, assigns.room.y_coordinate}, 
+        assigns.bounds, 
+        assigns.scale_factor
+      )
+      
+      # Define colors for rooms based on room type
+      {fill_color, stroke_color} = case assigns.room.room_type do
+        "safe_zone" -> {"#10b981", "#34d399"}      # Green for safe zones
+        "shop" -> {"#f59e0b", "#fbbf24"}           # Orange for shops
+        "dungeon" -> {"#7c2d12", "#dc2626"}        # Dark red for dungeons
+        "treasure_room" -> {"#eab308", "#facc15"}  # Gold for treasure rooms
+        "trap_room" -> {"#991b1b", "#ef4444"}      # Red for trap rooms
+        _ -> {"#3b82f6", "#60a5fa"}                # Blue for standard rooms
+==== BASE ====
       end
+==== BASE ====
+      
+      player_stroke = if assigns.is_player, do: "#ef4444", else: stroke_color
+      player_width = if assigns.is_player, do: "3", else: "1"
+      
+      assign(assigns, 
+        x_pos: x_pos, 
+        y_pos: y_pos, 
+        fill_color: fill_color, 
+        stroke_color: player_stroke,
+        stroke_width: player_width,
+        skip_render: false
+      )
+    end
+==== BASE ====
 
     ~H"""
     <%= unless @skip_render do %>
@@ -1062,78 +1271,63 @@ defmodule ShardWeb.MudGameLive do
     # Use preloaded associations
     from_room = assigns.door.from_room
     to_room = assigns.door.to_room
-
-    return_early =
-      from_room == nil or to_room == nil or
-        from_room.x_coordinate == nil or from_room.y_coordinate == nil or
-        to_room.x_coordinate == nil or to_room.y_coordinate == nil
-
-    assigns =
-      if return_early do
-        assign(assigns, :skip_render, true)
-      else
-        {x1, y1} =
-          calculate_minimap_position(
-            {from_room.x_coordinate, from_room.y_coordinate},
-            assigns.bounds,
-            assigns.scale_factor
-          )
-
-        {x2, y2} =
-          calculate_minimap_position(
-            {to_room.x_coordinate, to_room.y_coordinate},
-            assigns.bounds,
-            assigns.scale_factor
-          )
-
-        # Check if this is a one-way door (no return door in opposite direction)
-        is_one_way = is_one_way_door?(assigns.door)
-
-        # Determine if this is a diagonal door
-        is_diagonal =
-          assigns.door.direction in ["northeast", "northwest", "southeast", "southwest"]
-
-        # Color scheme based on door type and status
-        stroke_color =
-          cond do
-            # Red for locked doors
-            assigns.door.is_locked -> "#dc2626"
-            # Pink for one-way doors
-            is_one_way -> "#ec4899"
-            # Purple for portals
-            assigns.door.door_type == "portal" -> "#8b5cf6"
-            # Orange for gates
-            assigns.door.door_type == "gate" -> "#d97706"
-            # Dark red for locked gates
-            assigns.door.door_type == "locked_gate" -> "#991b1b"
-            # Gray for secret doors
-            assigns.door.door_type == "secret" -> "#6b7280"
-            # Orange for doors requiring keys
-            assigns.door.key_required && assigns.door.key_required != "" -> "#f59e0b"
-            # Green for standard doors
-            true -> "#22c55e"
-          end
-
-        # Adjust stroke width and style for diagonal doors
-        stroke_width = if is_diagonal, do: "1.5", else: "2"
-        stroke_dasharray = if is_diagonal, do: "3,2", else: nil
-
-        door_name =
-          assigns.door.name || "#{String.capitalize(assigns.door.door_type || "standard")} Door"
-
-        assign(assigns,
-          x1: x1,
-          y1: y1,
-          x2: x2,
-          y2: y2,
-          stroke_color: stroke_color,
-          stroke_width: stroke_width,
-          stroke_dasharray: stroke_dasharray,
-          door_name: door_name,
-          is_diagonal: is_diagonal,
-          skip_render: false
-        )
+==== BASE ====
+    
+    return_early = from_room == nil or to_room == nil or 
+                   from_room.x_coordinate == nil or from_room.y_coordinate == nil or
+                   to_room.x_coordinate == nil or to_room.y_coordinate == nil
+    
+    assigns = if return_early do
+      assign(assigns, :skip_render, true)
+    else
+      {x1, y1} = calculate_minimap_position(
+        {from_room.x_coordinate, from_room.y_coordinate}, 
+        assigns.bounds, 
+        assigns.scale_factor
+      )
+      {x2, y2} = calculate_minimap_position(
+        {to_room.x_coordinate, to_room.y_coordinate}, 
+        assigns.bounds, 
+        assigns.scale_factor
+      )
+      
+      # Check if this is a one-way door (no return door in opposite direction)
+      is_one_way = is_one_way_door?(assigns.door)
+      
+      # Determine if this is a diagonal door
+      is_diagonal = assigns.door.direction in ["northeast", "northwest", "southeast", "southwest"]
+      
+      # Color scheme based on door type and status
+      stroke_color = cond do
+        assigns.door.is_locked -> "#dc2626"  # Red for locked doors
+        is_one_way -> "#ec4899"  # Pink for one-way doors
+        assigns.door.door_type == "portal" -> "#8b5cf6"  # Purple for portals
+        assigns.door.door_type == "gate" -> "#d97706"  # Orange for gates
+        assigns.door.door_type == "locked_gate" -> "#991b1b"  # Dark red for locked gates
+        assigns.door.door_type == "secret" -> "#6b7280"  # Gray for secret doors
+        assigns.door.key_required && assigns.door.key_required != "" -> "#f59e0b"  # Orange for doors requiring keys
+        true -> "#22c55e"  # Green for standard doors
+==== BASE ====
       end
+==== BASE ====
+      
+      # Adjust stroke width and style for diagonal doors
+      stroke_width = if is_diagonal, do: "1.5", else: "2"
+      stroke_dasharray = if is_diagonal, do: "3,2", else: nil
+      
+      door_name = assigns.door.name || "#{String.capitalize(assigns.door.door_type || "standard")} Door"
+      
+      assign(assigns, 
+        x1: x1, y1: y1, x2: x2, y2: y2, 
+        stroke_color: stroke_color,
+        stroke_width: stroke_width,
+        stroke_dasharray: stroke_dasharray,
+        door_name: door_name,
+        is_diagonal: is_diagonal,
+        skip_render: false
+      )
+    end
+==== BASE ====
 
     ~H"""
     <%= unless @skip_render do %>
@@ -1211,6 +1405,12 @@ defmodule ShardWeb.MudGameLive do
           "  stats - Show your character stats",
           "  position - Show your current position",
           "  inventory - Show your inventory (coming soon)",
+          "  npc - Show descriptions of NPCs in this room",
+          "  talk \"npc_name\" - Talk to a specific NPC",
+          "  quest \"npc_name\" - Get quest from a specific NPC",
+          "  accept - Accept a quest offer",
+          "  deny - Deny a quest offer",
+          "  deliver_quest \"npc_name\" - Deliver completed quest to NPC",
           "  north/south/east/west - Move in cardinal directions",
           "  northeast/southeast/northwest/southwest - Move diagonally",
           "  Shortcuts: n/s/e/w/ne/se/nw/sw",
@@ -1221,18 +1421,17 @@ defmodule ShardWeb.MudGameLive do
 
       "look" ->
         {x, y} = game_state.player_position
+==== BASE ====
         tile = game_state.map_data |> Enum.at(y) |> Enum.at(x)
-
-        description =
-          case tile do
-            0 -> "You see a solid stone wall."
-            1 -> "You are standing on a stone floor. The air is cool and damp."
-            2 -> "You see clear blue water. It looks deep."
-            3 -> "A glittering treasure chest sits here, beckoning you closer."
-            _ -> "You see something strange and unidentifiable."
-          end
-
+        description = case tile do
+          0 -> "You see a solid stone wall."
+          1 -> "You are standing on a stone floor. The air is cool and damp."
+          2 -> "You see clear blue water. It looks deep."
+          3 -> "A glittering treasure chest sits here, beckoning you closer."
+          _ -> "You see something strange and unidentifiable."
+        end
         {[description], game_state}
+==== BASE ====
 
       "stats" ->
         stats = game_state.player_stats
@@ -1252,6 +1451,22 @@ defmodule ShardWeb.MudGameLive do
 
       "inventory" ->
         {["Your inventory is empty. (Feature coming soon!)"], game_state}
+
+      "npc" ->
+        {x, y} = game_state.player_position
+        npcs_here = get_npcs_at_location(x, y, game_state.map_id)
+
+        if length(npcs_here) > 0 do
+          response = ["NPCs in this area:"] ++
+            Enum.flat_map(npcs_here, fn npc ->
+              npc_name = Map.get(npc, :name) || "Unknown NPC"
+              npc_desc = Map.get(npc, :description) || "They look at you with interest."
+              ["", "#{npc_name}:", npc_desc]
+            end)
+          {response, game_state}
+        else
+          {["There are no NPCs in this area."], game_state}
+        end
 
       cmd when cmd in ["north", "n"] ->
         execute_movement(game_state, "ArrowUp")
@@ -1277,8 +1492,32 @@ defmodule ShardWeb.MudGameLive do
       cmd when cmd in ["southwest", "sw"] ->
         execute_movement(game_state, "southwest")
 
+      "accept" ->
+        execute_accept_quest(game_state)
+
+      "deny" ->
+        execute_deny_quest(game_state)
+
       _ ->
-        {["Unknown command: '#{command}'. Type 'help' for available commands."], game_state}
+        # Check if it's a talk command
+        case parse_talk_command(command) do
+          {:ok, npc_name} ->
+            execute_talk_command(game_state, npc_name)
+          :error ->
+            # Check if it's a quest command
+            case parse_quest_command(command) do
+              {:ok, npc_name} ->
+                execute_quest_command(game_state, npc_name)
+              :error ->
+                # Check if it's a deliver_quest command
+                case parse_deliver_quest_command(command) do
+                  {:ok, npc_name} ->
+                    execute_deliver_quest_command(game_state, npc_name)
+                  :error ->
+                    {["Unknown command: '#{command}'. Type 'help' for available commands."], game_state}
+                end
+            end
+        end
     end
   end
 
@@ -1304,8 +1543,31 @@ defmodule ShardWeb.MudGameLive do
         end
 
       # Update game state with new position
-      updated_game_state = %{game_state | player_position: new_pos}
+      #updated_game_state = %{game_state | player_position: new_pos}
+
+      # Check for NPCs at the new location
+      {new_x, new_y} = new_pos
+      npcs_here = get_npcs_at_location(new_x, new_y, game_state.map_id)
+
       response = ["You traversed #{direction_name}."]
+
+      # Add NPC presence notification if any NPCs are at the new location
+      if length(npcs_here) > 0 do
+        npc_names = Enum.map(npcs_here, & &1.name) |> Enum.join(", ")
+        response = response ++ ["You see #{npc_names} here."]
+      end
+
+      #To see if there are monsters
+      monsters = Enum.filter(game_state.monsters, fn value -> value[:position] == new_pos end)
+      monster_count = Enum.count(monsters)
+
+      response = response ++ case monster_count do
+        0 -> [""]
+        1 -> ["There is a " <> Enum.at(monsters, 0)[:name] <>"! It prepares to attack."]
+        _ -> ["There are " <> to_string(monster_count) <> " monsters! The monsters include " <> Enum.map_join(monsters, ", ", fn monster -> "a " <> to_string(monster[:name]) end) + ".", "They prepare to attack."]
+      end
+
+      updated_game_state = %{game_state | player_position: new_pos}
 
       {response, updated_game_state}
     end
@@ -1330,104 +1592,117 @@ defmodule ShardWeb.MudGameLive do
     "{#{x}, #{y}}"
   end
 
+==== BASE ====
   # Helper function to generate map data from database
   defp generate_map_from_database() do
     # Get all rooms from database
     rooms = Repo.all(GameMap.Room)
-
+    
     # If no rooms exist, return a simple default map
     if Enum.empty?(rooms) do
       generate_default_map()
+==== BASE ====
     else
+==== BASE ====
       # Find the bounds of all rooms
-      {min_x, max_x} =
-        rooms
-        |> Enum.map(& &1.x_coordinate)
-        |> Enum.filter(&(&1 != nil))
+      {min_x, max_x} = rooms 
+        |> Enum.map(& &1.x_coordinate) 
+        |> Enum.filter(& &1 != nil)
         |> case do
           [] -> {0, 10}
           coords -> Enum.min_max(coords)
+==== BASE ====
         end
-
-      {min_y, max_y} =
-        rooms
-        |> Enum.map(& &1.y_coordinate)
-        |> Enum.filter(&(&1 != nil))
+==== BASE ====
+      
+      {min_y, max_y} = rooms 
+        |> Enum.map(& &1.y_coordinate) 
+        |> Enum.filter(& &1 != nil)
         |> case do
           [] -> {0, 10}
           coords -> Enum.min_max(coords)
+==== BASE ====
         end
-
+==== BASE ====
+      
       # Add padding around the map
       min_x = min_x - 1
       max_x = max_x + 1
       min_y = min_y - 1
       max_y = max_y + 1
-
+      
       # Create a map of room coordinates for quick lookup
-      room_map =
-        rooms
+      room_map = rooms
         |> Enum.filter(fn room -> room.x_coordinate != nil and room.y_coordinate != nil end)
         |> Enum.into(%{}, fn room -> {{room.x_coordinate, room.y_coordinate}, room} end)
-
+      
       # Generate the grid
       for y <- min_y..max_y do
         for x <- min_x..max_x do
           case room_map[{x, y}] do
-            # Wall/empty space
-            nil ->
-              0
-
-            room ->
+            nil -> 0  # Wall/empty space
+            room -> 
               case room.room_type do
-                # Treasure room
-                "treasure" -> 3
-                # Water room
-                "water" -> 2
-                # Regular floor
-                _ -> 1
+                "treasure" -> 3  # Treasure room
+                "water" -> 2     # Water room
+                _ -> 1           # Regular floor
               end
+==== BASE ====
           end
         end
       end
     end
-  end
 
+    response ++ [
+      "",
+      "#{npc_name} waits to see if you have anything else to say."
+    ]
+  end
+==== BASE ====
+  
   # Fallback function for when no rooms exist in database
   defp generate_default_map() do
     # Generate an 11x11 map for display
     for y <- 0..10 do
       for x <- 0..10 do
         cond do
-          # Walls around the edges
-          x == 0 or y == 0 or x == 10 or y == 10 -> 0
-          # Treasure in the center
-          x == 5 and y == 5 -> 3
-          # Central room floor
-          x > 3 and x < 7 and y > 3 and y < 7 -> 1
-          # Water at intervals
-          rem(x, 3) == 0 and rem(y, 3) == 0 -> 2
-          # Default floor
-          true -> 1
+          x == 0 or y == 0 or x == 10 or y == 10 -> 0  # Walls around the edges
+          x == 5 and y == 5 -> 3  # Treasure in the center
+          x > 3 and x < 7 and y > 3 and y < 7 -> 1  # Central room floor
+          rem(x, 3) == 0 and rem(y, 3) == 0 -> 2  # Water at intervals
+          true -> 1  # Default floor
+==== BASE ====
         end
       end
     end
   end
-
+==== BASE ====
+  
+==== BASE ====
   # Find a valid starting position on the map (first non-wall tile)
-  defp find_valid_starting_position(map_data) do
-    # Search for the first floor tile (value 1, 2, or 3 - anything but 0 which is wall)
-    Enum.with_index(map_data)
-    |> Enum.find_value(fn {row, y} ->
-      Enum.with_index(row)
-      |> Enum.find_value(fn {cell, x} ->
-        if cell != 0, do: {x, y}, else: nil
+  defp find_valid_starting_position(_map_data) do
+    # For tutorial terrain, always start at {0,0} where Goldie is
+    {0, 0}
+  end
+
+  # Generate a position that is not where the player started
+  # Claude helped write this one
+  defp find_valid_monster_position(map_data, starting_position) do
+    # Find all floor tiles (value == 1) in the map
+    valid_positions = map_data
+      |> Enum.with_index()  # Get {row, y_index}
+      |> Enum.flat_map(fn {row, y_index} ->
+        row
+        |> Enum.with_index()  # Get {cell_value, x_index}
+        |> Enum.filter(fn {cell_value, _x_index} -> cell_value == 1 end)  # Only floor tiles
+        |> Enum.map(fn {_cell_value, x_index} -> {x_index, y_index} end)  # Convert to {x, y}
       end)
+==== BASE ====
     end)
     |> case do
-      # Fallback if no valid position found (shouldn't happen)
-      nil -> {0, 0}
+      nil -> {0, 0}  # Fallback if no valid position found (shouldn't happen)
       position -> position
+==== BASE ====
     end
   end
 
@@ -1459,11 +1734,11 @@ defmodule ShardWeb.MudGameLive do
       # Ensure minimum size to prevent division by zero
       width = max(width, 1)
       height = max(height, 1)
-
-      # 260 to leave 20px padding on each side
-      scale_x = 260 / width
-      # 160 to leave 20px padding top/bottom
-      scale_y = 160 / height
+==== BASE ====
+      
+      scale_x = 260 / width  # 260 to leave 20px padding on each side
+      scale_y = 160 / height  # 160 to leave 20px padding top/bottom
+==== BASE ====
       scale_factor = min(scale_x, scale_y)
 
       # Ensure minimum scale factor for visibility
@@ -1476,11 +1751,11 @@ defmodule ShardWeb.MudGameLive do
   # Calculate position within minimap coordinates
   defp calculate_minimap_position({x, y}, {min_x, min_y, _max_x, _max_y}, scale_factor) do
     # Translate to origin and scale, then center in minimap
-    # 20px padding
-    scaled_x = (x - min_x) * scale_factor + 20
-    # 20px padding
-    scaled_y = (y - min_y) * scale_factor + 20
-
+==== BASE ====
+    scaled_x = (x - min_x) * scale_factor + 20  # 20px padding
+    scaled_y = (y - min_y) * scale_factor + 20  # 20px padding
+    
+==== BASE ====
     # Ensure coordinates are within bounds
     scaled_x = max(10, min(scaled_x, 290))
     scaled_y = max(10, min(scaled_y, 190))
@@ -1527,13 +1802,14 @@ defmodule ShardWeb.MudGameLive do
 
   # Component for player marker when no room exists at player position
   def player_marker(assigns) do
-    {x_pos, y_pos} =
-      calculate_minimap_position(
-        assigns.position,
-        assigns.bounds,
-        assigns.scale_factor
-      )
-
+==== BASE ====
+    {x_pos, y_pos} = calculate_minimap_position(
+      assigns.position, 
+      assigns.bounds, 
+      assigns.scale_factor
+    )
+    
+==== BASE ====
     assigns = assign(assigns, x_pos: x_pos, y_pos: y_pos)
 
     ~H"""
@@ -1576,4 +1852,65 @@ defmodule ShardWeb.MudGameLive do
     <div class={"w-6 h-6 #{@color_class} #{@player_class} border border-gray-800"}></div>
     """
   end
+  # === Exits helpers ===
+
+  # (A) Convert a cardinal direction label to a key your calc_position/3 already understands
+  defp dir_to_key("north"), do: "ArrowUp"
+  defp dir_to_key("south"), do: "ArrowDown"
+  defp dir_to_key("east"),  do: "ArrowRight"
+  defp dir_to_key("west"),  do: "ArrowLeft"
+  defp dir_to_key("northeast"), do: "northeast"
+  defp dir_to_key("northwest"), do: "northwest"
+  defp dir_to_key("southeast"), do: "southeast"
+  defp dir_to_key("southwest"), do: "southwest"
+  defp dir_to_key(_), do: nil
+
+  # (B) Given the player’s current grid position {x, y}, compute which exits (doors) exist
+  defp compute_available_exits({x, y}) do
+    case GameMap.get_room_by_coordinates(x, y) do
+      nil ->
+        []
+      room ->
+        doors = GameMap.get_doors_from_room(room.id)
+        valid_dirs = MapSet.new(["north","south","east","west","northeast","northwest","southeast","southwest"])
+        doors
+        |> Enum.filter(fn d -> d.direction in valid_dirs end)
+        |> Enum.map(fn d -> %{direction: d.direction, door: d} end)
+    end
+  end
+
+  # (C) Handle clicking an exit button to move rooms
+  @impl true
+  def handle_event("click_exit", %{"dir" => dir}, socket) do
+    key = dir_to_key(dir)
+    player_position = socket.assigns.game_state.player_position
+    map_data        = socket.assigns.game_state.map_data
+
+    new_position =
+      case key do
+        nil -> player_position
+        _   -> calc_position(player_position, key, map_data)
+      end
+
+    terminal_state =
+      if new_position != player_position do
+        msg = "You move #{dir}."
+        Map.update!(socket.assigns.terminal_state, :output, &(&1 ++ [msg, ""]))
+      else
+        socket.assigns.terminal_state
+      end
+
+    game_state = %{
+      socket.assigns.game_state
+      | player_position: new_position
+    }
+
+    {:noreply,
+     assign(socket,
+       game_state: game_state,
+       terminal_state: terminal_state,
+       available_exits: compute_available_exits(game_state.player_position)
+     )}
+  end
+
 end

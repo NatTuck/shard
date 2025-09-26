@@ -40,6 +40,6 @@ npm-debug.log
 /assets/node_modules/
 
 .aider*
-
+.env
 # editor/backup files
 *.bak.*
