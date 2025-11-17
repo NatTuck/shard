@@ -18,6 +18,8 @@ defmodule Shard.Users.User do
     field :authenticated_at, :utc_datetime, virtual: true
     field :admin, :boolean, default: false
 
+    field :invite_code, :string, virtual: true
+
     timestamps(type: :utc_datetime)
   end
 
@@ -34,7 +36,7 @@ defmodule Shard.Users.User do
   """
   def email_changeset(user, attrs, opts \\ []) do
     user
-    |> cast(attrs, [:email, :admin])
+    |> cast(attrs, [:email, :admin, :invite_code])
     |> validate_email(opts)
   end
 
